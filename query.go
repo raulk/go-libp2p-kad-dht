@@ -2,7 +2,10 @@ package dht
 
 import (
 	"context"
+	"math"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	u "github.com/ipfs/go-ipfs-util"
 	logging "github.com/ipfs/go-log"
@@ -16,6 +19,7 @@ import (
 	queue "github.com/libp2p/go-libp2p-peerstore/queue"
 	routing "github.com/libp2p/go-libp2p-routing"
 	notif "github.com/libp2p/go-libp2p-routing/notifications"
+	errors "github.com/pkg/errors"
 )
 
 var maxQueryConcurrency = AlphaValue
@@ -70,10 +74,207 @@ func (q *dhtQuery) Run(ctx context.Context, peers []peer.ID) (*dhtQueryResult, e
 	return runner.Run(ctx, peers)
 }
 
+type stagingQueue struct {
+	dialFn func(context.Context, peer.ID) error
+	ctx    context.Context
+	// TODO maxParallelism int
+
+	parLk         sync.Mutex
+	parallelism   int
+	scalingFactor float64
+
+	in          *queue.ChanQueue
+	completedCh chan peer.ID
+
+	dieCh    chan struct{}
+	notifyCh chan struct{}
+
+	retChs   []chan dialResult
+	retChIdx int32
+}
+
+var StagingQueueMinParallelism = 6
+var StagingQueueMaxIdle = 5 * time.Second
+
+var ErrContextClosed = errors.New("context closed")
+
+func newStagingQueue(ctx context.Context, in *queue.ChanQueue, dialFn func(context.Context, peer.ID) error, nConsumers int) *stagingQueue {
+	sq := &stagingQueue{
+		dialFn:        dialFn,
+		ctx:           ctx,
+		scalingFactor: 1.5,
+		parallelism:   StagingQueueMinParallelism,
+		in:            in,
+
+		// TODO: we should really re-sort dials as they come back based on XORKeySpace, instead of queuing them in the
+		// order they come back.
+		completedCh: make(chan peer.ID),
+		dieCh:       make(chan struct{}, StagingQueueMinParallelism),
+		notifyCh:    make(chan struct{}),
+	}
+
+	sq.retChIdx = int32(nConsumers)
+	for ; nConsumers > 0; nConsumers-- {
+		sq.retChs = append(sq.retChs, make(chan dialResult))
+	}
+	for i := 0; i < StagingQueueMinParallelism; i++ {
+		go sq.worker()
+	}
+	return sq
+}
+
+type dialResult struct {
+	p   peer.ID
+	err error
+}
+
+func (sq *stagingQueue) Consume() (<-chan dialResult, error) {
+	// TODO: not super happy with this approach and the extra goroutine per consumption.
+	// Need to think of a better way.
+	chIdx := atomic.AddInt32(&sq.retChIdx, -1)
+	if chIdx < 0 {
+		atomic.AddInt32(&sq.retChIdx, 1)
+		return nil, errors.New("more concurrent calls to Consume() than declared")
+	}
+
+	ch := sq.retChs[chIdx]
+	go func() {
+		defer atomic.AddInt32(&sq.retChIdx, 1)
+		for {
+			select {
+			case <-sq.ctx.Done():
+				ch <- dialResult{"", ErrContextClosed}
+			case p := <-sq.completedCh:
+				ch <- dialResult{p, nil}
+			default:
+			}
+
+			// We have no finished dials to return, so this means it's time to scale up our
+			// parallelism, as demand is higher than supply.
+			sq.scaleUp()
+			<-sq.notifyCh
+
+			select {
+			case <-sq.ctx.Done():
+				ch <- dialResult{"", ErrContextClosed}
+			case p := <-sq.completedCh:
+				ch <- dialResult{p, nil}
+			}
+		}
+	}()
+	return ch, nil
+}
+
+func (sq *stagingQueue) scaleUp() {
+	// TODO: we need to debounce scaling, as we can easily end up with a swamp of scaleup calls if the entire DHT
+	// is progressing slowly.
+	sq.parLk.Lock()
+	defer sq.parLk.Unlock()
+
+	prev := sq.parallelism
+	tgt := int(math.Floor(float64(prev) * sq.scalingFactor))
+	for ; prev < tgt; prev++ {
+		go sq.worker()
+	}
+	sq.parallelism = tgt
+
+	// scale the buffer of dieCh accordingly; taking into account that we'll never kill workers beyond minParallelism.
+	dieCh := sq.dieCh
+	sq.dieCh = make(chan struct{}, tgt-StagingQueueMinParallelism)
+	close(dieCh)
+}
+
+func (sq *stagingQueue) scaleDown() {
+	// TODO: we need to debounce scaling, as we can easily end up with a swamp of scaledown calls if the entire DHT
+	// is progressing slowly.
+	sq.parLk.Lock()
+	defer sq.parLk.Unlock()
+
+	prev := sq.parallelism
+	tgt := int(math.Floor(float64(prev) / sq.scalingFactor))
+	if tgt < StagingQueueMinParallelism {
+		tgt = StagingQueueMinParallelism
+	}
+
+	// send as many die signals as workers we have to prune; we don't scale down the buffer of dieCh, as we might
+	// end up growing the pool again.
+	for ; prev > tgt; prev-- {
+		select {
+		case sq.dieCh <- struct{}{}:
+		default:
+			log.Debugf("too many die signals queued up.")
+		}
+	}
+	sq.parallelism = tgt
+}
+
+func (sq *stagingQueue) notify() {
+	select {
+	case sq.notifyCh <- struct{}{}:
+	default:
+	}
+}
+
+func (sq *stagingQueue) worker() {
+	timer := time.NewTimer(0)
+
+	for {
+		// trap exit signals first.
+		select {
+		case <-sq.ctx.Done():
+			return
+		case _, more := <-sq.dieCh:
+			// if channel is closed, it's being replaced by a new one, so we're not being told to die.
+			if more {
+				return
+			}
+		default:
+		}
+
+		// The idle timer tracks if the environment is slow, i.e.:
+		// (a) we're waiting too long before dequeing new peers (input), which is an indication that the DHT lookup
+		//     progressing slowly, therefore we can scale down.
+		// (b) the DHT controller consumes successful dials too slowly (output).
+		//
+		// We send scaleDown signals everytime this timer triggers.
+		timer.Reset(StagingQueueMaxIdle)
+		select {
+		case <-timer.C:
+			// we received no new dials to schedule during our idle period, so it's time to scale down.
+			sq.scaleDown()
+			continue
+		case p := <-sq.in.DeqChan:
+			if err := sq.dialFn(sq.ctx, p); err != nil {
+				log.Debugf("discarding dialled peer because of error: %v", err)
+				continue
+			}
+			timer.Reset(StagingQueueMaxIdle)
+
+		Handoff:
+			select {
+			case <-sq.ctx.Done():
+				return
+			case sq.completedCh <- p:
+				if !timer.Stop() {
+					<-timer.C
+				}
+				// all good; peer was handed off.
+				sq.notify()
+			case <-timer.C:
+				sq.scaleDown()
+				// keep trying to publish on the channel, but having sent the signal that the downstream goroutine
+				// has not read from us.
+				goto Handoff
+			}
+		}
+	}
+}
+
 type dhtQueryRunner struct {
 	query          *dhtQuery        // query to run
 	peersSeen      *pset.PeerSet    // all peers queried. prevent querying same peer 2x
 	peersQueried   *pset.PeerSet    // peers successfully connected to and queried
+	peersDialed    *stagingQueue    // peers we have dialed to
 	peersToQuery   *queue.ChanQueue // peers remaining to be queried
 	peersRemaining todoctr.Counter  // peersToQuery + currently processing
 
@@ -92,15 +293,17 @@ type dhtQueryRunner struct {
 func newQueryRunner(q *dhtQuery) *dhtQueryRunner {
 	proc := process.WithParent(process.Background())
 	ctx := ctxproc.OnClosingContext(proc)
-	return &dhtQueryRunner{
+	peersToQuery := queue.NewChanQueue(ctx, queue.NewXORDistancePQ(string(q.key)))
+	r := &dhtQueryRunner{
 		query:          q,
-		peersToQuery:   queue.NewChanQueue(ctx, queue.NewXORDistancePQ(string(q.key))),
 		peersRemaining: todoctr.NewSyncCounter(),
 		peersSeen:      pset.New(),
 		peersQueried:   pset.New(),
 		rateLimit:      make(chan struct{}, q.concurrency),
 		proc:           proc,
 	}
+	r.peersDialed = newStagingQueue(ctx, peersToQuery, r.dialPeer, AlphaValue)
+	return r
 }
 
 func (r *dhtQueryRunner) Run(ctx context.Context, peers []peer.ID) (*dhtQueryResult, error) {
@@ -192,7 +395,6 @@ func (r *dhtQueryRunner) addPeerToQuery(next peer.ID) {
 
 func (r *dhtQueryRunner) spawnWorkers(proc process.Process) {
 	for {
-
 		select {
 		case <-r.peersRemaining.Done():
 			return
@@ -201,8 +403,14 @@ func (r *dhtQueryRunner) spawnWorkers(proc process.Process) {
 			return
 
 		case <-r.rateLimit:
+			ch, err := r.peersDialed.Consume()
+			if err != nil {
+				// TODO an error here can only be thrown if we are consuming with a higher concurrency than we
+				//  declared upfront. Needs to be thought out better.
+				continue
+			}
 			select {
-			case p, more := <-r.peersToQuery.DeqChan:
+			case p, more := <-ch:
 				if !more {
 					// Put this back so we can finish any outstanding queries.
 					r.rateLimit <- struct{}{}
@@ -212,7 +420,7 @@ func (r *dhtQueryRunner) spawnWorkers(proc process.Process) {
 				// do it as a child func to make sure Run exits
 				// ONLY AFTER spawn workers has exited.
 				proc.Go(func(proc process.Process) {
-					r.queryPeer(proc, p)
+					r.queryPeer(proc, p.p)
 				})
 			case <-r.proc.Closing():
 				return
@@ -221,6 +429,39 @@ func (r *dhtQueryRunner) spawnWorkers(proc process.Process) {
 			}
 		}
 	}
+}
+
+func (r *dhtQueryRunner) dialPeer(ctx context.Context, p peer.ID) error {
+	// make sure we're connected to the peer.
+	// FIXME abstract away into the network layer
+	// Note: Failure to connect in this block will cause the function to
+	// short circuit.
+	if r.query.dht.host.Network().Connectedness(p) == inet.Connected {
+		return nil
+	}
+
+	log.Debug("not connected. dialing.")
+	notif.PublishQueryEvent(r.runCtx, &notif.QueryEvent{
+		Type: notif.DialingPeer,
+		ID:   p,
+	})
+
+	pi := pstore.PeerInfo{ID: p}
+	if err := r.query.dht.host.Connect(ctx, pi); err != nil {
+		log.Debugf("error connecting: %s", err)
+		notif.PublishQueryEvent(r.runCtx, &notif.QueryEvent{
+			Type:  notif.QueryError,
+			Extra: err.Error(),
+			ID:    p,
+		})
+
+		r.Lock()
+		r.errs = append(r.errs, err)
+		r.Unlock()
+		return err
+	}
+	log.Debugf("connected. dial success.")
+	return nil
 }
 
 func (r *dhtQueryRunner) queryPeer(proc process.Process, p peer.ID) {
@@ -235,42 +476,6 @@ func (r *dhtQueryRunner) queryPeer(proc process.Process, p peer.ID) {
 		r.peersRemaining.Decrement(1)
 		r.rateLimit <- struct{}{}
 	}()
-
-	// make sure we're connected to the peer.
-	// FIXME abstract away into the network layer
-	// Note: Failure to connect in this block will cause the function to
-	// short circuit.
-	if r.query.dht.host.Network().Connectedness(p) == inet.NotConnected {
-		log.Debug("not connected. dialing.")
-
-		notif.PublishQueryEvent(r.runCtx, &notif.QueryEvent{
-			Type: notif.DialingPeer,
-			ID:   p,
-		})
-		// while we dial, we do not take up a rate limit. this is to allow
-		// forward progress during potentially very high latency dials.
-		r.rateLimit <- struct{}{}
-
-		pi := pstore.PeerInfo{ID: p}
-
-		if err := r.query.dht.host.Connect(ctx, pi); err != nil {
-			log.Debugf("Error connecting: %s", err)
-
-			notif.PublishQueryEvent(r.runCtx, &notif.QueryEvent{
-				Type:  notif.QueryError,
-				Extra: err.Error(),
-				ID:    p,
-			})
-
-			r.Lock()
-			r.errs = append(r.errs, err)
-			r.Unlock()
-			<-r.rateLimit // need to grab it again, as we deferred.
-			return
-		}
-		<-r.rateLimit // need to grab it again, as we deferred.
-		log.Debugf("connected. dial success.")
-	}
 
 	// finally, run the query against this peer
 	res, err := r.query.qfunc(ctx, p)
