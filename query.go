@@ -2,9 +2,9 @@ package dht
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	u "github.com/ipfs/go-ipfs-util"
@@ -74,197 +74,201 @@ func (q *dhtQuery) Run(ctx context.Context, peers []peer.ID) (*dhtQueryResult, e
 	return runner.Run(ctx, peers)
 }
 
-type stagingQueue struct {
-	dialFn func(context.Context, peer.ID) error
+type dialQueue struct {
 	ctx    context.Context
-	// TODO maxParallelism int
+	dialFn func(context.Context, peer.ID) error
 
-	parLk         sync.Mutex
-	parallelism   int
-	scalingFactor float64
+	lk             sync.Mutex
+	nWorkers       int
+	scalingFactor  float64
+	lastScalingEvt time.Time
 
-	in          *queue.ChanQueue
-	completedCh chan peer.ID
+	in  *queue.ChanQueue
+	out *queue.ChanQueue
 
-	dieCh    chan struct{}
-	notifyCh chan struct{}
-
-	retChs   []chan dialResult
-	retChIdx int32
+	waiting chan chan<- peer.ID
+	dieCh   chan struct{}
 }
 
-var StagingQueueMinParallelism = 6
-var StagingQueueMaxIdle = 5 * time.Second
+var DialQueueMinParallelism = 6
+var DialQueueMaxParallelism = 20
+var DialQueueMaxIdle = 5 * time.Second
+var DialQueueScalingMutePeriod = 1 * time.Second
 
 var ErrContextClosed = errors.New("context closed")
 
-func newStagingQueue(ctx context.Context, in *queue.ChanQueue, dialFn func(context.Context, peer.ID) error, nConsumers int) *stagingQueue {
-	sq := &stagingQueue{
-		dialFn:        dialFn,
+// newDialQueue returns an adaptive dial queue that spawns a dynamically sized set of goroutines to preemptively
+// stage dials for later handoff to the DHT protocol for RPC.
+//
+// Why? Dialing is expensive. It's orders of magnitude slower than running an RPC on an already-established
+// connection, as it requires establishing a TCP connection, multistream handshake, crypto handshake, mux handshake,
+// and protocol negotiation.
+//
+// We start with DialQueueMinParallelism number of workers, and scale up and down based on demand and supply of
+// dialled peers.
+//
+// The following events trigger scaling:
+//  - there are no successful dials to return immediately when requested (i.e. consumer stalls) => scale up.
+//  - there are no consumers to hand off a successful dial to when requested (i.e. producer stalls) => scale down.
+//
+// We ought to watch out for dialler throttling (e.g. FD limit exceeded), to avoid adding fuel to the fire. Since
+// we have no deterministic way to detect this, for now we are hard-limiting concurrency by a max factor.
+func newDialQueue(ctx context.Context, target string, in *queue.ChanQueue, dialFn func(context.Context, peer.ID) error, nConsumers int) *dialQueue {
+	sq := &dialQueue{
 		ctx:           ctx,
+		dialFn:        dialFn,
+		nWorkers:      DialQueueMinParallelism,
 		scalingFactor: 1.5,
-		parallelism:   StagingQueueMinParallelism,
-		in:            in,
 
-		// TODO: we should really re-sort dials as they come back based on XORKeySpace, instead of queuing them in the
-		// order they come back.
-		completedCh: make(chan peer.ID),
-		dieCh:       make(chan struct{}, StagingQueueMinParallelism),
-		notifyCh:    make(chan struct{}),
+		in:      in,
+		out:     queue.NewChanQueue(ctx, queue.NewXORDistancePQ(target)),
+		waiting: make(chan chan<- peer.ID, nConsumers),
+		dieCh:   make(chan struct{}, DialQueueMinParallelism),
 	}
-
-	sq.retChIdx = int32(nConsumers)
-	for ; nConsumers > 0; nConsumers-- {
-		sq.retChs = append(sq.retChs, make(chan dialResult))
-	}
-	for i := 0; i < StagingQueueMinParallelism; i++ {
+	for i := 0; i < DialQueueMinParallelism; i++ {
 		go sq.worker()
 	}
+	go sq.feedWaiting()
 	return sq
 }
 
-type dialResult struct {
-	p   peer.ID
-	err error
+func (dq *dialQueue) feedWaiting() {
+	var out chan<- peer.ID
+	var t time.Time // for logging purposes
+	for {
+		select {
+		case <-dq.ctx.Done():
+			return
+		case out = <-dq.waiting: // got a channel that's waiting for a peer.
+			t = time.Now()
+		}
+
+		select {
+		case <-dq.ctx.Done():
+			return
+		case p := <-dq.out.DeqChan:
+			log.Debugf("delivering dialled peer to DHT; took %dms.", time.Now().Sub(t)/time.Millisecond)
+			out <- p
+		}
+		close(out)
+	}
 }
 
-func (sq *stagingQueue) Consume() (<-chan dialResult, error) {
-	// TODO: not super happy with this approach and the extra goroutine per consumption.
-	// Need to think of a better way.
-	chIdx := atomic.AddInt32(&sq.retChIdx, -1)
-	if chIdx < 0 {
-		atomic.AddInt32(&sq.retChIdx, 1)
-		return nil, errors.New("more concurrent calls to Consume() than declared")
+func (dq *dialQueue) Consume() (<-chan peer.ID, error) {
+	ch := make(chan peer.ID, 1)
+	select {
+	case <-dq.ctx.Done():
+		return nil, ErrContextClosed
+	case p := <-dq.out.DeqChan:
+		ch <- p
+		close(ch)
+		return ch, nil
+	default:
 	}
 
-	ch := sq.retChs[chIdx]
-	go func() {
-		defer atomic.AddInt32(&sq.retChIdx, 1)
-		for {
-			select {
-			case <-sq.ctx.Done():
-				ch <- dialResult{"", ErrContextClosed}
-			case p := <-sq.completedCh:
-				ch <- dialResult{p, nil}
-			default:
-			}
+	// we have no finished dials to return, trigger a scale up.
+	dq.hintGrow()
 
-			// We have no finished dials to return, so this means it's time to scale up our
-			// parallelism, as demand is higher than supply.
-			sq.scaleUp()
-			<-sq.notifyCh
-
-			select {
-			case <-sq.ctx.Done():
-				ch <- dialResult{"", ErrContextClosed}
-			case p := <-sq.completedCh:
-				ch <- dialResult{p, nil}
-			}
-		}
-	}()
+	// let feedWaiters handle returning a peer.
+	select {
+	case dq.waiting <- ch:
+	default:
+		return nil, errors.New("more consumers that declared upfront")
+	}
 	return ch, nil
 }
 
-func (sq *stagingQueue) scaleUp() {
-	// TODO: we need to debounce scaling, as we can easily end up with a swamp of scaleup calls if the entire DHT
-	// is progressing slowly.
-	sq.parLk.Lock()
-	defer sq.parLk.Unlock()
-
-	prev := sq.parallelism
-	tgt := int(math.Floor(float64(prev) * sq.scalingFactor))
-	for ; prev < tgt; prev++ {
-		go sq.worker()
+func (dq *dialQueue) hintGrow() {
+	dq.lk.Lock()
+	defer dq.lk.Unlock()
+	if dq.nWorkers == DialQueueMaxParallelism || time.Now().Sub(dq.lastScalingEvt) < DialQueueScalingMutePeriod {
+		return
 	}
-	sq.parallelism = tgt
+	prev := dq.nWorkers
+	tgt := int(math.Floor(float64(prev) * dq.scalingFactor))
+	if tgt > DialQueueMaxParallelism {
+		tgt = DialQueueMinParallelism
+	}
+	for ; prev < tgt; prev++ {
+		go dq.worker()
+	}
+	dq.nWorkers = tgt
 
 	// scale the buffer of dieCh accordingly; taking into account that we'll never kill workers beyond minParallelism.
-	dieCh := sq.dieCh
-	sq.dieCh = make(chan struct{}, tgt-StagingQueueMinParallelism)
+	dieCh := dq.dieCh
+	dq.dieCh = make(chan struct{}, tgt-DialQueueMinParallelism)
 	close(dieCh)
+
+	dq.lastScalingEvt = time.Now()
 }
 
-func (sq *stagingQueue) scaleDown() {
-	// TODO: we need to debounce scaling, as we can easily end up with a swamp of scaledown calls if the entire DHT
-	// is progressing slowly.
-	sq.parLk.Lock()
-	defer sq.parLk.Unlock()
+func (dq *dialQueue) hintShrink() {
+	dq.lk.Lock()
+	defer dq.lk.Unlock()
 
-	prev := sq.parallelism
-	tgt := int(math.Floor(float64(prev) / sq.scalingFactor))
-	if tgt < StagingQueueMinParallelism {
-		tgt = StagingQueueMinParallelism
+	if dq.nWorkers == DialQueueMinParallelism || time.Now().Sub(dq.lastScalingEvt) < DialQueueScalingMutePeriod {
+		return
+	}
+	prev := dq.nWorkers
+	tgt := int(math.Floor(float64(prev) / dq.scalingFactor))
+	if tgt < DialQueueMinParallelism {
+		tgt = DialQueueMinParallelism
 	}
 
-	// send as many die signals as workers we have to prune; we don't scale down the buffer of dieCh, as we might
-	// end up growing the pool again.
+	// send as many die signals as workers we have to prune. we don't scale down the buffer of dieCh,
+	// as we might need to grow the pool again.
 	for ; prev > tgt; prev-- {
 		select {
-		case sq.dieCh <- struct{}{}:
+		case dq.dieCh <- struct{}{}:
 		default:
 			log.Debugf("too many die signals queued up.")
 		}
 	}
-	sq.parallelism = tgt
+	dq.nWorkers = tgt
+
+	dq.lastScalingEvt = time.Now()
 }
 
-func (sq *stagingQueue) notify() {
-	select {
-	case sq.notifyCh <- struct{}{}:
-	default:
-	}
-}
-
-func (sq *stagingQueue) worker() {
+func (dq *dialQueue) worker() {
 	timer := time.NewTimer(0)
 
 	for {
 		// trap exit signals first.
 		select {
-		case <-sq.ctx.Done():
+		case <-dq.ctx.Done():
 			return
-		case _, more := <-sq.dieCh:
-			// if channel is closed, it's being replaced by a new one, so we're not being told to die.
+		case _, more := <-dq.dieCh:
 			if more {
+				// if channel is still open, we're being told to die.
+				// if channel is closed, it's just being replaced by a new one.
 				return
 			}
 		default:
 		}
 
-		// The idle timer tracks if the environment is slow, i.e.:
-		// (a) we're waiting too long before dequeing new peers (input), which is an indication that the DHT lookup
-		//     progressing slowly, therefore we can scale down.
-		// (b) the DHT controller consumes successful dials too slowly (output).
+		// This idle timer tracks if the environment is slow. This could happen if we're waiting too long before
+		// dequeuing a peers to dial (input), or if the DHT controller consumes successful dials too slowly (output).
 		//
 		// We send scaleDown signals everytime this timer triggers.
-		timer.Reset(StagingQueueMaxIdle)
+		timer.Reset(DialQueueMaxIdle)
 		select {
 		case <-timer.C:
-			// we received no new dials to schedule during our idle period, so it's time to scale down.
-			sq.scaleDown()
+			// no new dial requests during our idle period; time to scale down.
+			dq.hintShrink()
 			continue
-		case p := <-sq.in.DeqChan:
-			if err := sq.dialFn(sq.ctx, p); err != nil {
+		case p := <-dq.in.DeqChan:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			if err := dq.dialFn(dq.ctx, p); err != nil {
 				log.Debugf("discarding dialled peer because of error: %v", err)
 				continue
 			}
-			timer.Reset(StagingQueueMaxIdle)
+			timer.Reset(DialQueueMaxIdle)
 
-		Handoff:
-			select {
-			case <-sq.ctx.Done():
-				return
-			case sq.completedCh <- p:
-				if !timer.Stop() {
-					<-timer.C
-				}
-				// all good; peer was handed off.
-				sq.notify()
-			case <-timer.C:
-				sq.scaleDown()
-				// keep trying to publish on the channel, but having sent the signal that the downstream goroutine
-				// has not read from us.
-				goto Handoff
+			dq.out.EnqChan <- p
+			if len(dq.waiting) == 0 {
+				dq.hintShrink()
 			}
 		}
 	}
@@ -274,7 +278,7 @@ type dhtQueryRunner struct {
 	query          *dhtQuery        // query to run
 	peersSeen      *pset.PeerSet    // all peers queried. prevent querying same peer 2x
 	peersQueried   *pset.PeerSet    // peers successfully connected to and queried
-	peersDialed    *stagingQueue    // peers we have dialed to
+	peersDialed    *dialQueue       // peers we have dialed to
 	peersToQuery   *queue.ChanQueue // peers remaining to be queried
 	peersRemaining todoctr.Counter  // peersToQuery + currently processing
 
@@ -300,9 +304,10 @@ func newQueryRunner(q *dhtQuery) *dhtQueryRunner {
 		peersSeen:      pset.New(),
 		peersQueried:   pset.New(),
 		rateLimit:      make(chan struct{}, q.concurrency),
+		peersToQuery:   peersToQuery,
 		proc:           proc,
 	}
-	r.peersDialed = newStagingQueue(ctx, peersToQuery, r.dialPeer, AlphaValue)
+	r.peersDialed = newDialQueue(ctx, q.key, peersToQuery, r.dialPeer, AlphaValue)
 	return r
 }
 
@@ -405,22 +410,16 @@ func (r *dhtQueryRunner) spawnWorkers(proc process.Process) {
 		case <-r.rateLimit:
 			ch, err := r.peersDialed.Consume()
 			if err != nil {
-				// TODO an error here can only be thrown if we are consuming with a higher concurrency than we
-				//  declared upfront. Needs to be thought out better.
+				log.Warningf("error while fetching a dialled peer: %v", err)
+				r.rateLimit <- struct{}{}
 				continue
 			}
 			select {
-			case p, more := <-ch:
-				if !more {
-					// Put this back so we can finish any outstanding queries.
-					r.rateLimit <- struct{}{}
-					return // channel closed.
-				}
-
+			case p, _ := <-ch:
 				// do it as a child func to make sure Run exits
 				// ONLY AFTER spawn workers has exited.
 				proc.Go(func(proc process.Process) {
-					r.queryPeer(proc, p.p)
+					r.queryPeer(proc, p)
 				})
 			case <-r.proc.Closing():
 				return
@@ -432,10 +431,7 @@ func (r *dhtQueryRunner) spawnWorkers(proc process.Process) {
 }
 
 func (r *dhtQueryRunner) dialPeer(ctx context.Context, p peer.ID) error {
-	// make sure we're connected to the peer.
-	// FIXME abstract away into the network layer
-	// Note: Failure to connect in this block will cause the function to
-	// short circuit.
+	// short-circuit if we're already connected.
 	if r.query.dht.host.Network().Connectedness(p) == inet.Connected {
 		return nil
 	}
