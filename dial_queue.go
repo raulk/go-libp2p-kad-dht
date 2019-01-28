@@ -22,16 +22,17 @@ type dialQueue struct {
 	ctx    context.Context
 	dialFn func(context.Context, peer.ID) error
 
-	lk             sync.Mutex
-	nWorkers       int
-	scalingFactor  float64
-	lastScalingEvt time.Time
+	lk            sync.Mutex
+	nWorkers      int
+	scalingFactor float64
 
 	in  *queue.ChanQueue
 	out *queue.ChanQueue
 
-	waiting chan chan<- peer.ID
-	dieCh   chan struct{}
+	waitingCh chan chan<- peer.ID
+	dieCh     chan struct{}
+	growCh    chan struct{}
+	shrinkCh  chan struct{}
 }
 
 // newDialQueue returns an adaptive dial queue that spawns a dynamically sized set of goroutines to preemptively
@@ -57,42 +58,83 @@ func newDialQueue(ctx context.Context, target string, in *queue.ChanQueue, dialF
 		nWorkers:      DialQueueMinParallelism,
 		scalingFactor: 1.5,
 
-		in:      in,
-		out:     queue.NewChanQueue(ctx, queue.NewXORDistancePQ(target)),
-		waiting: make(chan chan<- peer.ID, nConsumers),
-		dieCh:   make(chan struct{}, DialQueueMinParallelism),
+		in:  in,
+		out: queue.NewChanQueue(ctx, queue.NewXORDistancePQ(target)),
+
+		growCh:    make(chan struct{}, nConsumers),
+		shrinkCh:  make(chan struct{}, 1),
+		waitingCh: make(chan chan<- peer.ID, nConsumers),
+		dieCh:     make(chan struct{}, DialQueueMaxParallelism),
 	}
 	for i := 0; i < DialQueueMinParallelism; i++ {
 		go sq.worker()
 	}
-	go sq.feedWaiting()
+	go sq.control()
 	return sq
 }
 
-func (dq *dialQueue) feedWaiting() {
-	var out chan<- peer.ID
-	var t time.Time // for logging purposes
+func (dq *dialQueue) control() {
+	var (
+		t              time.Time // for logging purposes
+		p              peer.ID
+		dialled        = dq.out.DeqChan
+		resp           chan<- peer.ID
+		waiting        chan chan<- peer.ID
+		lastScalingEvt = time.Now()
+	)
 	for {
+		// First process any backlog of dial jobs and waiters -- making progress is the priority.
+		// This block is copied below; couldn't find a more concise way of doing this.
 		select {
 		case <-dq.ctx.Done():
 			return
-		case out = <-dq.waiting: // got a channel that's waiting for a peer.
+		case p = <-dialled:
 			t = time.Now()
+			dialled, waiting = nil, dq.waitingCh
+			continue // onto the top.
+		case resp = <-waiting:
+			// got a channel that's waiting for a peer.
+			log.Debugf("delivering dialled peer to DHT; took %dms.", time.Now().Sub(t)/time.Millisecond)
+			resp <- p
+			close(resp)
+			dialled, waiting = dq.out.DeqChan, nil // stop consuming waiting jobs until we've cleared a peer.
+			continue                               // onto the top.
+		default:
+			// there's nothing to process, so proceed onto the main select block.
 		}
 
 		select {
 		case <-dq.ctx.Done():
 			return
-		case p := <-dq.out.DeqChan:
+		case p = <-dialled:
+			t = time.Now()
+			dialled, waiting = nil, dq.waitingCh
+		case resp = <-waiting:
+			// got a channel that's waiting for a peer.
 			log.Debugf("delivering dialled peer to DHT; took %dms.", time.Now().Sub(t)/time.Millisecond)
-			out <- p
+			resp <- p
+			close(resp)
+			dialled, waiting = dq.out.DeqChan, nil // stop consuming waiting jobs until we've cleared a peer.
+		case <-dq.growCh:
+			if time.Now().Sub(lastScalingEvt) < DialQueueScalingMutePeriod {
+				continue
+			}
+			dq.grow()
+			lastScalingEvt = time.Now()
+		case <-dq.shrinkCh:
+			if time.Now().Sub(lastScalingEvt) < DialQueueScalingMutePeriod {
+				continue
+			}
+			dq.shrink()
+			lastScalingEvt = time.Now()
 		}
-		close(out)
 	}
 }
 
 func (dq *dialQueue) Consume() (<-chan peer.ID, error) {
 	ch := make(chan peer.ID, 1)
+
+	// short circuit and return a dialled peer if it's immediately available.
 	select {
 	case <-dq.ctx.Done():
 		return nil, ErrContextClosed
@@ -104,120 +146,104 @@ func (dq *dialQueue) Consume() (<-chan peer.ID, error) {
 	}
 
 	// we have no finished dials to return, trigger a scale up.
-	if dq.in.Queue.Len() > 0 {
-		dq.hintGrow()
+	select {
+	case dq.growCh <- struct{}{}:
+	default:
 	}
 
-	// let feedWaiters handle returning a peer.
+	// park the channel until a dialled peer becomes available.
 	select {
-	case dq.waiting <- ch:
+	case dq.waitingCh <- ch:
 	default:
-		return nil, errors.New("more consumers that declared upfront")
+		return nil, errors.New("detected more consuming goroutines than declared upfront")
 	}
 	return ch, nil
 }
 
-func (dq *dialQueue) hintGrow() {
+func (dq *dialQueue) grow() {
 	dq.lk.Lock()
 	defer dq.lk.Unlock()
-
-	if dq.nWorkers == DialQueueMaxParallelism || time.Now().Sub(dq.lastScalingEvt) < DialQueueScalingMutePeriod {
+	if dq.nWorkers == DialQueueMaxParallelism {
 		return
 	}
-	prev := dq.nWorkers
-	tgt := int(math.Floor(float64(prev) * dq.scalingFactor))
-	if tgt > DialQueueMaxParallelism {
-		tgt = DialQueueMinParallelism
+	target := int(math.Floor(float64(dq.nWorkers) * dq.scalingFactor))
+	if target > DialQueueMaxParallelism {
+		target = DialQueueMinParallelism
 	}
-	for ; prev < tgt; prev++ {
+	for ; dq.nWorkers < target; dq.nWorkers++ {
 		go dq.worker()
 	}
-	dq.nWorkers = tgt
-
-	// scale the buffer of dieCh accordingly; taking into account that we'll never kill workers beyond minParallelism.
-	dieCh := dq.dieCh
-	dq.dieCh = make(chan struct{}, tgt-DialQueueMinParallelism)
-	close(dieCh)
-
-	dq.lastScalingEvt = time.Now()
 }
 
-func (dq *dialQueue) hintShrink() {
+func (dq *dialQueue) shrink() {
 	dq.lk.Lock()
 	defer dq.lk.Unlock()
-
-	if dq.nWorkers == DialQueueMinParallelism || time.Now().Sub(dq.lastScalingEvt) < DialQueueScalingMutePeriod {
+	if dq.nWorkers == DialQueueMinParallelism {
 		return
 	}
-	prev := dq.nWorkers
-	tgt := int(math.Floor(float64(prev) / dq.scalingFactor))
-	if tgt < DialQueueMinParallelism {
-		tgt = DialQueueMinParallelism
+	target := int(math.Floor(float64(dq.nWorkers) / dq.scalingFactor))
+	if target < DialQueueMinParallelism {
+		target = DialQueueMinParallelism
 	}
-
-	// send as many die signals as workers we have to prune. we don't scale down the buffer of dieCh,
-	// as we might need to grow the pool again.
-	for ; prev > tgt; prev-- {
+	// send as many die signals as workers we have to prune.
+	for ; dq.nWorkers > target; dq.nWorkers-- {
 		select {
 		case dq.dieCh <- struct{}{}:
 		default:
 			log.Debugf("too many die signals queued up.")
 		}
 	}
-	dq.nWorkers = tgt
-
-	dq.lastScalingEvt = time.Now()
 }
 
 func (dq *dialQueue) worker() {
-	timer := time.NewTimer(0)
-	if !timer.Stop() {
-		<-timer.C
-	}
+	// This idle timer tracks if the environment is slow. If we're waiting to long to acquire a peer to dial,
+	// it means that the DHT query is progressing slow and we should shrink the worker pool.
+	idleTimer := time.NewTimer(0)
 
 	for {
 		// trap exit signals first.
 		select {
 		case <-dq.ctx.Done():
 			return
-		case _, more := <-dq.dieCh:
-			if more {
-				// if channel is still open, we're being told to die.
-				// if channel is closed, it's just being replaced by a new one.
-				return
-			}
+		case <-dq.dieCh:
+			return
 		default:
 		}
 
-		// This idle timer tracks if the environment is slow. This could happen if we're waiting too long before
-		// dequeuing a peers to dial (input), or if the DHT controller consumes successful dials too slowly (output).
-		//
-		// We send scaleDown signals everytime this timer triggers.
-		timer.Reset(DialQueueMaxIdle)
+		if !idleTimer.Stop() {
+			select {
+			case <-idleTimer.C:
+			default:
+			}
+		}
+		idleTimer.Reset(DialQueueMaxIdle)
+
 		select {
-		case <-dq.ctx.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
+		case <-dq.dieCh:
 			return
-		case <-timer.C:
+		case <-dq.ctx.Done():
+			return
+		case <-idleTimer.C:
 			// no new dial requests during our idle period; time to scale down.
-			dq.hintShrink()
-			continue
 		case p := <-dq.in.DeqChan:
-			if !timer.Stop() {
-				<-timer.C
-			}
 			if err := dq.dialFn(dq.ctx, p); err != nil {
 				log.Debugf("discarding dialled peer because of error: %v", err)
 				continue
 			}
-			timer.Reset(DialQueueMaxIdle)
-
+			waiting := len(dq.waitingCh)
 			dq.out.EnqChan <- p
-			if len(dq.waiting) == 0 {
-				dq.hintShrink()
+			if waiting > 0 {
+				// we have somebody to deliver this value to, so no need to shrink.
+				continue
 			}
 		}
+
+		// scaling down; control only arrives here if the idle timer fires, or if there are no goroutines
+		// waiting for the value we just produced.
+		select {
+		case dq.shrinkCh <- struct{}{}:
+		default:
+		}
+
 	}
 }
