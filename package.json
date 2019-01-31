@@ -114,9 +114,9 @@
     },
     {
       "author": "whyrusleeping",
-      "hash": "QmUDTcnDp2WssbmiDLC6aYurUeyt7QeRakHUQMxA2mZ5iB",
+      "hash": "QmUAMDGeFJLmfXfjEfLvJTNBmV7d25Q1uAZPnSNTAKCEb2",
       "name": "go-libp2p",
-      "version": "6.0.23"
+      "version": "6.0.24"
     },
     {
       "author": "whyrusleeping",
@@ -156,9 +156,9 @@
     },
     {
       "author": "whyrusleeping",
-      "hash": "QmVHhT8NxtApPTndiZPe4JNGNUxGWtJe3ebyxtRz4HnbEp",
+      "hash": "QmTwDm2KHzro9uJL7KVJRVGFTYvju2AbpyFBFZB3dqKeSB",
       "name": "go-libp2p-swarm",
-      "version": "3.0.22"
+      "version": "3.0.23"
     }
   ],
   "gxVersion": "0.4.0",
